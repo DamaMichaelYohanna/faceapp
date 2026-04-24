@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+python-multipart
+cryptography
+python-jose[cryptography]
+passlib[bcrypt]
+pillow
+python-dotenv
+numpy
+pytest
+httpx
+insightface
+onnxruntime
+faiss-cpu
+opencv-python
