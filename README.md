@@ -55,6 +55,23 @@ The system is designed for high-security environments, ensuring that biometric t
    BIOMETRIC_SECRET_KEY=your_generated_fernet_key
    ```
 
+## Troubleshooting: Installation Errors
+
+### Error: "Microsoft Visual C++ 14.0 or greater is required"
+If you encounter this error while installing `insightface`, it is because the library is attempting to compile C++ extensions but lacks the necessary build tools or pre-compiled binaries for your Python version.
+
+#### Solution 1: Use a Stable Python Version (Recommended)
+This project is most stable on **Python 3.11 or 3.12**.
+- AI/ML libraries like InsightFace often lack ready-to-use binaries for "bleeding edge" versions like Python 3.13.
+- By using Python 3.11 or 3.12, `pip` will download pre-built "wheels," bypassing the need for C++ compilation entirely.
+
+#### Solution 2: Install Microsoft C++ Build Tools
+If you must use a newer Python version:
+1. Download the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+2. In the installer, select the **"Desktop development with C++"** workload.
+3. Ensure **"MSVC v14x"** and **"Windows 10/11 SDK"** are selected.
+4. Restart your terminal and retry the installation.
+
 ## Usage
 
 ### Running the Server
