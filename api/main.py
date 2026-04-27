@@ -50,7 +50,17 @@ async def lifespan(app: FastAPI):
         if not settings:
             settings = models.SystemSettings()
             db.add(settings)
-            db.commit()
+            
+        # Create default admin if none exists
+        admin = db.query(models.Admin).first()
+        if not admin:
+            default_admin = models.Admin(
+                username=os.getenv("ADMIN_USERNAME", "admin"),
+                hashed_password=security.get_password_hash(os.getenv("ADMIN_PASSWORD", "admin123"))
+            )
+            db.add(default_admin)
+            
+        db.commit()
         
         # Warm up Face Engine
         get_face_engine()
@@ -70,10 +80,53 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+
 # --- Dependency ---
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/admin/login")
+
+def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, security.JWT_SECRET_KEY, algorithms=[security.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    admin = db.query(models.Admin).filter(models.Admin.username == username).first()
+    if admin is None or not admin.is_active:
+        raise credentials_exception
+    return admin
 
 def get_settings(db: Session = Depends(database.get_db)):
     return db.query(models.SystemSettings).first()
+
+# --- Public & Auth API ---
+
+@app.post("/api/v1/admin/login", response_model=schemas.Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
+    admin = db.query(models.Admin).filter(models.Admin.username == form_data.username).first()
+    if not admin or not security.verify_password(form_data.password, admin.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not admin.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+        
+    access_token = security.create_access_token(
+        data={"sub": admin.username}
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # --- Public API ---
 
@@ -84,7 +137,11 @@ def read_root():
 # --- Student Management (Existing) ---
 
 @app.post("/api/v1/students/", response_model=schemas.Student)
-def create_student(student: schemas.StudentCreate, db: Session = Depends(database.get_db)):
+def create_student(
+    student: schemas.StudentCreate, 
+    db: Session = Depends(database.get_db),
+    admin: models.Admin = Depends(get_current_admin)
+):
     db_student = db.query(models.Student).filter(models.Student.external_id == student.external_id).first()
     if db_student:
         raise HTTPException(status_code=400, detail="Student already registered")
@@ -99,21 +156,50 @@ def create_student(student: schemas.StudentCreate, db: Session = Depends(databas
     return new_student
 
 @app.get("/api/v1/students/", response_model=List[schemas.Student])
-def list_students(skip: int = 0, limit: int = 100, db: Session = Depends(database.get_db)):
+def list_students(
+    skip: int = 0, 
+    limit: int = 100, 
+    db: Session = Depends(database.get_db),
+    admin: models.Admin = Depends(get_current_admin)
+):
     return db.query(models.Student).offset(skip).limit(limit).all()
 
 # --- Biometric Enrollment ---
 
 @app.post("/api/v1/enroll/upload", status_code=status.HTTP_201_CREATED)
 async def enroll_face(
-    student_id: int = Form(...),
+    matric_number: str = Form(...),
     metadata: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    admin: models.Admin = Depends(get_current_admin)
 ):
-    student = db.query(models.Student).filter(models.Student.id == student_id).first()
+    import httpx
+    
+    # 1. Fetch from Main Storage API
+    external_api_url = os.getenv("EXTERNAL_STUDENT_API_URL", "http://localhost:8080/api/students/")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{external_api_url}{matric_number}")
+            if response.status_code != 200:
+                raise HTTPException(status_code=404, detail=f"Student {matric_number} not found in main storage")
+            student_data = response.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with main storage: {str(e)}")
+
+    # 2. Sync with local database
+    student = db.query(models.Student).filter(models.Student.external_id == matric_number).first()
     if not student:
-        raise HTTPException(status_code=404, detail="Student not found")
+        # Create student locally if they exist in main storage but not here
+        # Assuming the external API returns a 'full_name' field
+        full_name = student_data.get("full_name", "Unknown Name")
+        student = models.Student(
+            external_id=matric_number,
+            full_name=full_name
+        )
+        db.add(student)
+        db.commit()
+        db.refresh(student)
 
     contents = await file.read()
     engine = get_face_engine()
@@ -134,14 +220,14 @@ async def enroll_face(
     })
 
     # Save to DB
-    db_enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.student_id == student_id).first()
+    db_enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.student_id == student.id).first()
     if db_enrollment:
         db_enrollment.face_template = encrypted_template
         db_enrollment.status = models.EnrollmentStatus.ACTIVE
         db_enrollment.metadata_json = metadata_dict
     else:
         db_enrollment = models.FaceEnrollment(
-            student_id=student_id,
+            student_id=student.id,
             face_template=encrypted_template,
             status=models.EnrollmentStatus.ACTIVE,
             metadata_json=metadata_dict
@@ -152,7 +238,7 @@ async def enroll_face(
     db.commit()
     
     # Update FAISS
-    get_faiss_service().add_student(student_id, embedding)
+    get_faiss_service().add_student(student.id, embedding)
     
     return {"status": "success", "message": "Face enrollment completed"}
 
@@ -181,7 +267,8 @@ async def verify_student(
     images: List[UploadFile] = File(...),
     audit_info: Optional[str] = Form(None),
     db: Session = Depends(database.get_db),
-    settings: models.SystemSettings = Depends(get_settings)
+    settings: models.SystemSettings = Depends(get_settings),
+    admin: models.Admin = Depends(get_current_admin)
 ):
     student = db.query(models.Student).filter(models.Student.id == student_id).first()
     if not student or not student.biometric_enrolled:
@@ -234,7 +321,8 @@ async def identify_student(
     images: List[UploadFile] = File(...),
     audit_info: Optional[str] = Form(None),
     db: Session = Depends(database.get_db),
-    settings: models.SystemSettings = Depends(get_settings)
+    settings: models.SystemSettings = Depends(get_settings),
+    admin: models.Admin = Depends(get_current_admin)
 ):
     # 1. Process Images
     embedding, liveness_passed = await process_verification_images(images, settings.liveness_enabled)
@@ -286,11 +374,18 @@ async def identify_student(
 # --- Admin API ---
 
 @app.get("/admin/settings", response_model=schemas.SystemSettings)
-def get_admin_settings(settings: models.SystemSettings = Depends(get_settings)):
+def get_admin_settings(
+    settings: models.SystemSettings = Depends(get_settings),
+    admin: models.Admin = Depends(get_current_admin)
+):
     return settings
 
 @app.put("/admin/settings", response_model=schemas.SystemSettings)
-def update_admin_settings(payload: schemas.SystemSettingsUpdate, db: Session = Depends(database.get_db)):
+def update_admin_settings(
+    payload: schemas.SystemSettingsUpdate, 
+    db: Session = Depends(database.get_db),
+    admin: models.Admin = Depends(get_current_admin)
+):
     settings = db.query(models.SystemSettings).first()
     for field, value in payload.dict().items():
         setattr(settings, field, value)
@@ -299,7 +394,10 @@ def update_admin_settings(payload: schemas.SystemSettingsUpdate, db: Session = D
     return settings
 
 @app.post("/admin/reload-index")
-def reload_index(db: Session = Depends(database.get_db)):
+def reload_index(
+    db: Session = Depends(database.get_db),
+    admin: models.Admin = Depends(get_current_admin)
+):
     load_faiss_index(db)
     return {"message": "FAISS index reloaded successfully"}
 
