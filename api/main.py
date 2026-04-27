@@ -80,8 +80,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
+
+# Allow all origins so the HTML frontend (opened as file://) can reach the API.
+# Restrict origins to your domain in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Dependency ---
 
@@ -128,32 +139,66 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+from fastapi.responses import JSONResponse
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    print(f"CRITICAL ERROR: {exc}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}", "traceback": traceback.format_exc()}
+    )
+
 # --- Public API ---
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Production Face Biometric API", "docs": "/docs"}
 
-# --- Student Management (Existing) ---
+# --- Mock / External Student Lookup ---
 
-@app.post("/api/v1/students/", response_model=schemas.Student)
-def create_student(
-    student: schemas.StudentCreate, 
-    db: Session = Depends(database.get_db),
-    admin: models.Admin = Depends(get_current_admin)
-):
-    db_student = db.query(models.Student).filter(models.Student.external_id == student.external_id).first()
-    if db_student:
-        raise HTTPException(status_code=400, detail="Student already registered")
-    
-    new_student = models.Student(
-        external_id=student.external_id,
-        full_name=student.full_name
-    )
-    db.add(new_student)
-    db.commit()
-    db.refresh(new_student)
-    return new_student
+# A small in-memory mock registry for development.
+# Populate this or set USE_MOCK_EXTERNAL_API=false to use the real external API.
+MOCK_STUDENTS = {
+    "FT22ACMP0833": {"full_name": "Michael Dama"},
+    "FT22ACMP0843": {"full_name": "Abdul Jaleel"},
+    "FT22ACMP0803": {"full_name": "Chinedu Okafor"},
+    "FT22ACMP0804": {"full_name": "Fatima Al-Hassan"},
+    "FT22ACMP0805": {"full_name": "David Musa"},
+}
+
+async def fetch_student_from_external(matric_number: str) -> dict:
+    """
+    Fetches student data either from the real external API or a local mock,
+    depending on the USE_MOCK_EXTERNAL_API environment variable.
+    Returns a dict with at least a 'full_name' key, or raises HTTPException.
+    """
+    use_mock = os.getenv("USE_MOCK_EXTERNAL_API", "true").lower() == "true"
+
+    if use_mock:
+        student_data = MOCK_STUDENTS.get(matric_number)
+        if not student_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"[MOCK] Student '{matric_number}' not found. Add them to MOCK_STUDENTS in main.py or use the real API."
+            )
+        return student_data
+
+    # --- Real external API call ---
+    import httpx
+    external_api_url = os.getenv("EXTERNAL_STUDENT_API_URL", "http://localhost:8080/api/students/")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{external_api_url}{matric_number}")
+            if response.status_code != 200:
+                raise HTTPException(status_code=404, detail=f"Student '{matric_number}' not found in main storage")
+            return response.json()
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with main storage: {str(e)}")
+
+# --- Student Management ---
 
 @app.get("/api/v1/students/", response_model=List[schemas.Student])
 def list_students(
@@ -174,18 +219,8 @@ async def enroll_face(
     db: Session = Depends(database.get_db),
     admin: models.Admin = Depends(get_current_admin)
 ):
-    import httpx
-    
-    # 1. Fetch from Main Storage API
-    external_api_url = os.getenv("EXTERNAL_STUDENT_API_URL", "http://localhost:8080/api/students/")
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{external_api_url}{matric_number}")
-            if response.status_code != 200:
-                raise HTTPException(status_code=404, detail=f"Student {matric_number} not found in main storage")
-            student_data = response.json()
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to communicate with main storage: {str(e)}")
+    # 1. Fetch from external source (real API or mock)
+    student_data = await fetch_student_from_external(matric_number)
 
     # 2. Sync with local database
     student = db.query(models.Student).filter(models.Student.external_id == matric_number).first()
@@ -208,39 +243,47 @@ async def enroll_face(
     embedding = engine.get_embedding(contents)
     if embedding is None:
         raise HTTPException(status_code=400, detail="No face detected in image")
+    
+    print(f"DEBUG: Enrollment Embedding Shape: {embedding.shape}, Norm: {np.linalg.norm(embedding)}")
 
     # Encrypt
     encrypted_template = security.encrypt_data(embedding.tobytes())
 
     # Metadata
-    metadata_dict = json.loads(metadata) if metadata else {}
+    metadata_dict = json.loads(metadata) if metadata and metadata.strip() else {}
     metadata_dict.update({
         "engine": "insightface_buffalo_l",
         "image_hash": utils.get_image_hash(contents)
     })
 
-    # Save to DB
-    db_enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.student_id == student.id).first()
-    if db_enrollment:
-        db_enrollment.face_template = encrypted_template
-        db_enrollment.status = models.EnrollmentStatus.ACTIVE
-        db_enrollment.metadata_json = metadata_dict
-    else:
-        db_enrollment = models.FaceEnrollment(
-            student_id=student.id,
-            face_template=encrypted_template,
-            status=models.EnrollmentStatus.ACTIVE,
-            metadata_json=metadata_dict
-        )
-        db.add(db_enrollment)
+    try:
+        # Save to DB
+        db_enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.student_id == student.id).first()
+        if db_enrollment:
+            db_enrollment.face_template = encrypted_template
+            db_enrollment.status = models.EnrollmentStatus.ACTIVE
+            db_enrollment.metadata_json = metadata_dict
+        else:
+            db_enrollment = models.FaceEnrollment(
+                student_id=student.id,
+                face_template=encrypted_template,
+                status=models.EnrollmentStatus.ACTIVE,
+                metadata_json=metadata_dict
+            )
+            db.add(db_enrollment)
 
-    student.biometric_enrolled = True
-    db.commit()
-    
-    # Update FAISS
-    get_faiss_service().add_student(student.id, embedding)
-    
-    return {"status": "success", "message": "Face enrollment completed"}
+        student.biometric_enrolled = True
+        db.commit()
+        
+        # Update FAISS
+        get_faiss_service().add_student(student.id, embedding)
+        
+        return {"status": "success", "message": f"Face enrollment completed for {student.full_name}"}
+    except Exception as e:
+        db.rollback()
+        print(f"Enrollment Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database or Engine error: {str(e)}")
 
 # --- Verification & Identification ---
 
@@ -261,19 +304,30 @@ async def process_verification_images(files: List[UploadFile], liveness_enabled:
     
     return embedding, liveness_passed
 
-@app.post("/api/v1/verify/{student_id}", response_model=schemas.StandardResponse)
+@app.post("/api/v1/verify/{identifier}", response_model=schemas.StandardResponse)
 async def verify_student(
-    student_id: int,
-    images: List[UploadFile] = File(...),
-    audit_info: Optional[str] = Form(None),
+    identifier: str,
+    file: UploadFile = File(..., description="Main face image for verification"),
+    extra_frames: List[UploadFile] = File([], description="Additional frames for liveness detection"),
+    audit_info: Optional[str] = Form(None, description="Optional JSON string for audit metadata"),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
     admin: models.Admin = Depends(get_current_admin)
 ):
-    student = db.query(models.Student).filter(models.Student.id == student_id).first()
+    # Try looking up by internal ID first if it's numeric, otherwise by external_id
+    student = None
+    if identifier.isdigit():
+        student = db.query(models.Student).filter(models.Student.id == int(identifier)).first()
+    
+    if not student:
+        student = db.query(models.Student).filter(models.Student.external_id == identifier).first()
+        
     if not student or not student.biometric_enrolled:
-        raise HTTPException(status_code=400, detail="Student not enrolled")
+        raise HTTPException(status_code=400, detail="Student not found or not enrolled")
 
+    # Combine images for processing
+    images = [file] + extra_frames
+    
     # 1. Process Images & Liveness
     embedding, liveness_passed = await process_verification_images(images, settings.liveness_enabled)
     
@@ -282,34 +336,41 @@ async def verify_student(
     
     if settings.liveness_enabled and not liveness_passed:
         return schemas.StandardResponse(
-            matched=False, student_id=student_id, confidence=0.0,
+            matched=False, student_id=student.id, confidence=0.0,
             mode="1:1", liveness_passed=False, message="Liveness check failed"
         )
 
     # 2. Get stored template
     stored_enrollment = student.enrollment
+    if not stored_enrollment:
+        raise HTTPException(status_code=400, detail="Student has no biometric template")
+
     decrypted_stored_template = security.decrypt_data(stored_enrollment.face_template)
     stored_embedding = np.frombuffer(decrypted_stored_template, dtype=np.float32)
 
+    print(f"DEBUG: Verify Live Embedding Norm: {np.linalg.norm(embedding)}")
+    print(f"DEBUG: Verify Stored Embedding Norm: {np.linalg.norm(stored_embedding)}")
+
     # 3. Match
     confidence = float(np.dot(embedding, stored_embedding)) # Both are pre-normalized
+    print(f"DEBUG: Resulting Confidence: {confidence}")
     matched = confidence >= settings.similarity_threshold
 
     # 4. Log
     log = models.VerificationRecord(
-        student_id=student_id,
+        student_id=student.id,
         match_score=confidence,
         is_successful=matched,
         matching_mode="1:1",
         liveness_passed=liveness_passed,
-        audit_metadata=json.loads(audit_info) if audit_info else None
+        audit_metadata=json.loads(audit_info) if audit_info and audit_info.strip() else None
     )
     db.add(log)
     db.commit()
 
     return schemas.StandardResponse(
         matched=matched,
-        student_id=student_id,
+        student_id=student.id,
         confidence=confidence,
         mode="1:1",
         liveness_passed=liveness_passed,
@@ -318,12 +379,16 @@ async def verify_student(
 
 @app.post("/api/v1/identify", response_model=schemas.StandardResponse)
 async def identify_student(
-    images: List[UploadFile] = File(...),
-    audit_info: Optional[str] = Form(None),
+    file: UploadFile = File(..., description="Face image to identify"),
+    extra_frames: List[UploadFile] = File([], description="Optional extra frames for liveness"),
+    audit_info: Optional[str] = Form(None, description="Optional JSON string for audit metadata"),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
     admin: models.Admin = Depends(get_current_admin)
 ):
+    # Combine images
+    images = [file] + extra_frames
+    
     # 1. Process Images
     embedding, liveness_passed = await process_verification_images(images, settings.liveness_enabled)
     
@@ -357,7 +422,7 @@ async def identify_student(
         is_successful=matched,
         matching_mode="1:N",
         liveness_passed=liveness_passed,
-        audit_metadata={"search_results": results, "audit": json.loads(audit_info) if audit_info else {}}
+        audit_metadata={"search_results": results, "audit": json.loads(audit_info) if audit_info and audit_info.strip() else {}}
     )
     db.add(log)
     db.commit()
