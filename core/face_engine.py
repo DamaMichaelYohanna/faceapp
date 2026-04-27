@@ -8,7 +8,7 @@ class FaceEngine:
     def __init__(self, model_name="buffalo_l"):
         """
         Initialize the InsightFace engine.
-        Using CPU-only mode by default as requested.
+        Using CPU-only mode by default.
         """
         self.app = FaceAnalysis(name=model_name, providers=['CPUExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
