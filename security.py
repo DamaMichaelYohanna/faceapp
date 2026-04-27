@@ -8,14 +8,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Encryption Key for Biometric Templates
-# In production, this should be a robust environment variable or secret manager
+#TODO this should be a robust environment variable or secret manager
 ENCRYPTION_KEY = os.getenv("BIOMETRIC_SECRET_KEY", Fernet.generate_key().decode())
 cipher_suite = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
 
 # JWT Settings
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+from passlib.context import CryptContext
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
 
 def encrypt_data(data: bytes) -> bytes:
     """Encrypt sensitive biometric data."""
