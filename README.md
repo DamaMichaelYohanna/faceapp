@@ -90,30 +90,13 @@ The Face Biometric API follows RESTful principles and uses JSON for all request 
 
 ### 1. Student Management
 
-#### **Create Student**
-`POST /api/v1/students/`
+#### **Sync Student from External Source**
+Students are no longer registered manually via this API. Instead, they are fetched from an external Main Storage API (or a built-in mock registry for development) during the enrollment process.
 
-Register a new student profile. This must be done before biometric enrollment.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `external_id` | `string` | Unique identifier from your external system (e.g., Reg Number). |
-| `full_name` | `string` | The student's full legal name. |
-
-**Example Request:**
-```json
-{
-  "external_id": "STU-2024-001",
-  "full_name": "Michael Dama"
-}
-```
-
----
-
-#### **List Students**
+#### **List Enrolled Students**
 `GET /api/v1/students/`
 
-Retrieve a list of all registered students with pagination.
+Retrieve a list of all students who have already completed biometric enrollment.
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -127,41 +110,42 @@ Retrieve a list of all registered students with pagination.
 #### **Enroll Face**
 `POST /api/v1/enroll/upload`
 
-Processes a face image, extracts a 512D embedding, encrypts it, and stores it as the student's biometric template.
+Processes a face image, extracts a 512D embedding, and stores it. This endpoint automatically syncs the student's profile from the external storage if they are not already in the local database.
 
 **Content-Type:** `multipart/form-data`
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `student_id` | `integer` | Internal DB ID of the student (not `external_id`). |
-| `file` | `file` | A high-quality JPG or PNG image containing a clear, forward-facing face. |
-| `metadata` | `string` | (Optional) JSON string for custom data (e.g., `{"device": "iPhone 15"}`). |
+| `matric_number` | `string` | The student's unique ID (Matric/Reg number). |
+| `file` | `file` | A high-quality JPG or PNG image. |
+| `metadata` | `string` | (Optional) JSON string for custom data. |
 
 ---
 
 ### 3. Verification & Identification
 
 #### **Verify Student (1:1)**
-`POST /api/v1/verify/{student_id}`
+`POST /api/v1/verify/{identifier}`
 
-Compares live capture frames against the stored template for a specific student.
+Compares live capture frames against the stored template. You can use either the internal Database ID or the external Matric Number as the `identifier`.
 
 **Content-Type:** `multipart/form-data`
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `student_id` | `integer` | Path parameter. The student's internal ID. |
-| `images` | `files[]` | One or more images (frames). If multiple are sent, liveness detection is performed. |
-| `audit_info` | `string` | (Optional) JSON string for audit trails (e.g., `{"location": "Exam Hall A"}`). |
+| `identifier` | `string` | Path parameter. Internal ID or Matric Number. |
+| `file` | `file` | Primary face image for verification. |
+| `extra_frames` | `files[]` | Optional additional frames for liveness detection. |
+| `audit_info` | `string` | (Optional) JSON string for audit trails. |
 
 **Standard Response Schema:**
 ```json
 {
-  "matched": true,         // Boolean: True if score >= threshold
-  "student_id": 1,         // Integer: The verified student's ID
-  "confidence": 0.824,     // Float: Cosine similarity score (0.0 to 1.0)
-  "mode": "1:1",           // String: Matching mode used
-  "liveness_passed": true, // Boolean: Result of anti-spoofing check
+  "matched": true,
+  "student_id": 1,
+  "confidence": 0.824,
+  "mode": "1:1",
+  "liveness_passed": true,
   "message": "Match successful"
 }
 ```
@@ -171,13 +155,14 @@ Compares live capture frames against the stored template for a specific student.
 #### **Identify Student (1:N)**
 `POST /api/v1/identify`
 
-Searches the entire database to find the closest match for the provided face using high-speed FAISS search.
+Searches the entire database to find the closest match for the provided face.
 
 **Content-Type:** `multipart/form-data`
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `images` | `files[]` | One or more images for matching and liveness check. |
+| `file` | `file` | Primary face image to identify. |
+| `extra_frames` | `files[]` | Optional additional frames for liveness. |
 | `audit_info` | `string` | (Optional) JSON for audit logs. |
 
 ---
@@ -248,6 +233,12 @@ Example Error:
 - Biometric data is never stored as raw images; only encrypted mathematical embeddings are persisted.
 - Each verification attempt is logged with a similarity score and liveness result for audit trailing.
 - Cosine similarity thresholding (default 0.65) ensures a balance between False Acceptance Rate (FAR) and False Rejection Rate (FRR).
+
+## Frontend Test Console
+A sleek, single-page testing utility is provided in `frontend/index.html`. 
+1. Open the file in any modern web browser.
+2. Ensure the API server is running.
+3. Use the console to log in, enroll students (using mock matric numbers), and perform biometric verification.
 
 ## License
 Confidential and Proprietary.
