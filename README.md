@@ -182,7 +182,30 @@ Searches the entire database to find the closest match for the provided face usi
 
 ---
 
-### 4. System Administration
+### 4. System Administration & Security
+
+#### **Admin Authentication**
+`POST /api/v1/admin/login`
+
+All administrative and core biometric endpoints (management, enrollment, verification, identification, and settings) are secured using OAuth2 with JWT Bearer tokens. You must obtain an access token to interact with these endpoints.
+
+**Example Request:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/admin/login" \
+     -H "Content-Type: application/x-www-form-urlencoded" \
+     -d "username=admin&password=admin123"
+```
+
+**Response:**
+```json
+{
+  "access_token": "eyJhbG...",
+  "token_type": "bearer"
+}
+```
+*Note: A default admin user is created on the first startup using the `ADMIN_USERNAME` and `ADMIN_PASSWORD` environment variables (defaults to `admin` / `admin123`). Pass the token in the `Authorization: Bearer <token>` header for secured endpoints.*
+
+---
 
 #### **System Settings**
 `GET /admin/settings` | `PUT /admin/settings`
