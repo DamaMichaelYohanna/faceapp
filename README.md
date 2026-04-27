@@ -79,13 +79,147 @@ If you must use a newer Python version:
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
-### API Endpoints
-- `POST /api/v1/students/`: Register a new student.
-- `POST /api/v1/enroll/upload`: Upload an image to enroll a student in biometrics.
-- `POST /api/v1/verify/{student_id}`: Perform 1:1 identity verification.
-- `POST /api/v1/identify`: Perform 1:N identification across the entire database.
-- `GET /admin/settings`: Retrieve current system configuration.
-- `PUT /admin/settings`: Update threshold and security settings.
+## API Documentation
+
+The Face Biometric API follows RESTful principles and uses JSON for all request and response bodies (except for file uploads).
+
+### Base URL
+`http://<server-ip>:8000`
+
+---
+
+### 1. Student Management
+
+#### **Create Student**
+`POST /api/v1/students/`
+
+Register a new student profile. This must be done before biometric enrollment.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `external_id` | `string` | Unique identifier from your external system (e.g., Reg Number). |
+| `full_name` | `string` | The student's full legal name. |
+
+**Example Request:**
+```json
+{
+  "external_id": "STU-2024-001",
+  "full_name": "Michael Dama"
+}
+```
+
+---
+
+#### **List Students**
+`GET /api/v1/students/`
+
+Retrieve a list of all registered students with pagination.
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `skip` | `integer` | `0` | Number of records to skip. |
+| `limit` | `integer` | `100` | Maximum number of records to return. |
+
+---
+
+### 2. Biometric Enrollment
+
+#### **Enroll Face**
+`POST /api/v1/enroll/upload`
+
+Processes a face image, extracts a 512D embedding, encrypts it, and stores it as the student's biometric template.
+
+**Content-Type:** `multipart/form-data`
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `student_id` | `integer` | Internal DB ID of the student (not `external_id`). |
+| `file` | `file` | A high-quality JPG or PNG image containing a clear, forward-facing face. |
+| `metadata` | `string` | (Optional) JSON string for custom data (e.g., `{"device": "iPhone 15"}`). |
+
+---
+
+### 3. Verification & Identification
+
+#### **Verify Student (1:1)**
+`POST /api/v1/verify/{student_id}`
+
+Compares live capture frames against the stored template for a specific student.
+
+**Content-Type:** `multipart/form-data`
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `student_id` | `integer` | Path parameter. The student's internal ID. |
+| `images` | `files[]` | One or more images (frames). If multiple are sent, liveness detection is performed. |
+| `audit_info` | `string` | (Optional) JSON string for audit trails (e.g., `{"location": "Exam Hall A"}`). |
+
+**Standard Response Schema:**
+```json
+{
+  "matched": true,         // Boolean: True if score >= threshold
+  "student_id": 1,         // Integer: The verified student's ID
+  "confidence": 0.824,     // Float: Cosine similarity score (0.0 to 1.0)
+  "mode": "1:1",           // String: Matching mode used
+  "liveness_passed": true, // Boolean: Result of anti-spoofing check
+  "message": "Match successful"
+}
+```
+
+---
+
+#### **Identify Student (1:N)**
+`POST /api/v1/identify`
+
+Searches the entire database to find the closest match for the provided face using high-speed FAISS search.
+
+**Content-Type:** `multipart/form-data`
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `images` | `files[]` | One or more images for matching and liveness check. |
+| `audit_info` | `string` | (Optional) JSON for audit logs. |
+
+---
+
+### 4. System Administration
+
+#### **System Settings**
+`GET /admin/settings` | `PUT /admin/settings`
+
+Manage the core behavior of the biometric engine.
+
+| Setting | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `similarity_threshold` | `float` | `0.65` | Minimum score to consider a match a "Success". |
+| `liveness_enabled` | `bool` | `true` | Toggle the anti-spoofing engine. |
+| `max_attempts` | `int` | `3` | Recommended limit for verification retries. |
+
+---
+
+#### **Control Endpoints**
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/admin/reload-index` | Forces the FAISS engine to reload all templates from the DB into memory. |
+| `GET` | `/health` | Returns system health, engine status, and current index size. |
+| `GET` | `/` | API root and link to interactive Swagger docs. |
+
+---
+
+### Error Responses
+
+The API uses standard HTTP status codes:
+- `400 Bad Request`: Validation errors, no face detected, or student already registered.
+- `404 Not Found`: Student ID does not exist.
+- `500 Internal Server Error`: Unexpected AI engine or database failure.
+
+Example Error:
+```json
+{
+  "detail": "No face detected in image"
+}
+```
 
 ## Security Considerations
 - Biometric data is never stored as raw images; only encrypted mathematical embeddings are persisted.
