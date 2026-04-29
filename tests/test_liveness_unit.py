@@ -1,0 +1,112 @@
+"""
+Unit tests for LivenessDetector.check_liveness().
+
+Tests exercise each decision branch of the algorithm in isolation:
+  - minimum frame count guard
+  - still-photo rejection (mean_diff < STILL_PHOTO_THRESHOLD 0.15)
+  - natural-motion pass band (0.15 ≤ mean_diff ≤ 15.0)
+  - excessive-motion rejection (mean_diff > EXCESSIVE_MOTION_THRESHOLD 15.0)
+  - per-frame Laplacian texture check (variance < 50 → False)
+  - resilience to malformed / undecodable byte buffers
+
+No server, database, or ML model is required — the LivenessDetector
+uses only cv2 and numpy, both of which are unconditionally installed.
+"""
+
+import pytest
+
+from core.liveness import LivenessDetector
+from tests.helpers import (
+    blurry_frame,
+    high_motion_frame,
+    noisy_frame,
+    sharp_frame,
+)
+
+
+class TestLivenessDetector:
+    """Unit tests for LivenessDetector.check_liveness(frames_bytes)."""
+
+    # ── Frame-count guards ────────────────────────────────────────────────────
+
+    def test_zero_frames_returns_false(self):
+        """No frames at all — cannot compute inter-frame difference."""
+        assert LivenessDetector.check_liveness([]) is False
+
+    def test_single_frame_returns_false(self):
+        """Only one valid frame — algorithm requires at least two."""
+        assert LivenessDetector.check_liveness([sharp_frame()]) is False
+
+    # ── Still-photo detection ─────────────────────────────────────────────────
+
+    def test_identical_frames_rejected_as_static(self):
+        """
+        Two copies of the same JPEG bytes decode to identical greyscale arrays.
+        absdiff is all zeros → mean_diff == 0 < STILL_PHOTO_THRESHOLD (0.15) → False.
+        """
+        frame = sharp_frame()
+        assert LivenessDetector.check_liveness([frame, frame]) is False
+
+    def test_three_identical_frames_rejected_as_static(self):
+        """Same result with three frames — all consecutive diffs remain zero."""
+        frame = sharp_frame()
+        assert LivenessDetector.check_liveness([frame, frame, frame]) is False
+
+    # ── Natural-motion pass band ──────────────────────────────────────────────
+
+    def test_natural_motion_passes_with_three_frames(self):
+        """
+        Main capture (sharp) + two differently-seeded noisy variants.
+        mean_diff of consecutive pairs ≈ 4–8, well within (0.15, 15.0).
+        All frames are individually sharp (Laplacian variance >> 50).
+        Expected: True.
+        """
+        frames = [sharp_frame(), noisy_frame(seed=0), noisy_frame(seed=1)]
+        assert LivenessDetector.check_liveness(frames) is True
+
+    def test_natural_motion_passes_with_two_frames(self):
+        """
+        Edge case: the minimum frame count (2) is sufficient when motion
+        is present and both frames pass the texture check.
+        """
+        assert LivenessDetector.check_liveness([sharp_frame(), noisy_frame(seed=7)]) is True
+
+    # ── Excessive-motion rejection ────────────────────────────────────────────
+
+    def test_excessive_motion_is_rejected(self):
+        """
+        A phase-shifted checkerboard differs from sharp_frame by ≈160 units
+        in ~50 % of pixels → mean_diff ≈ 80 >> EXCESSIVE_MOTION_THRESHOLD (15.0).
+        Both frames are individually sharp → texture check passes.
+        Overall expected: False (excessive motion).
+        """
+        frames = [sharp_frame(), high_motion_frame()]
+        assert LivenessDetector.check_liveness(frames) is False
+
+    # ── Per-frame texture check ───────────────────────────────────────────────
+
+    def test_blurry_frame_fails_texture_check(self):
+        """
+        A heavily Gaussian-blurred frame has Laplacian variance << 50.
+        Even with natural motion present in the other frames, a single
+        blurry frame causes the texture check to return False.
+        """
+        frames = [sharp_frame(), noisy_frame(seed=0), blurry_frame()]
+        assert LivenessDetector.check_liveness(frames) is False
+
+    # ── Resilience to malformed input ─────────────────────────────────────────
+
+    def test_all_malformed_bytes_return_false(self):
+        """
+        Byte buffers that cv2.imdecode cannot parse are silently skipped.
+        Zero valid frames → fewer than 2 → False.
+        """
+        bad = b"this-is-not-a-jpeg"
+        assert LivenessDetector.check_liveness([bad, bad, bad]) is False
+
+    def test_one_valid_plus_malformed_returns_false(self):
+        """
+        One decodable frame + one corrupt buffer → only 1 valid greyscale
+        frame after filtering → fewer than 2 → False.
+        """
+        assert LivenessDetector.check_liveness([sharp_frame(), b"corrupt"]) is False
