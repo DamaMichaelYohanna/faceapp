@@ -1,8 +1,9 @@
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
+import traceback
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
@@ -80,6 +81,8 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+MIN_ACTIVE_LIVENESS_FRAMES = 3
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
@@ -140,7 +143,6 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     return {"access_token": access_token, "token_type": "bearer"}
 
 from fastapi.responses import JSONResponse
-import traceback
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -179,12 +181,16 @@ async def fetch_student_from_external(matric_number: str) -> dict:
 
     if use_mock:
         student_data = MOCK_STUDENTS.get(matric_number)
-        if not student_data:
-            raise HTTPException(
-                status_code=404,
-                detail=f"[MOCK] Student '{matric_number}' not found. Add them to MOCK_STUDENTS in main.py or use the real API."
-            )
-        return student_data
+        if student_data:
+            return student_data
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"[MOCK] Student '{matric_number}' not found. "
+                f"Allowed IDs: {list(MOCK_STUDENTS.keys())}"
+            ),
+        )
 
     # --- Real external API call ---
     import httpx
@@ -197,6 +203,53 @@ async def fetch_student_from_external(matric_number: str) -> dict:
             return response.json()
     except httpx.RequestError as e:
         raise HTTPException(status_code=500, detail=f"Failed to communicate with main storage: {str(e)}")
+
+
+def _parse_json_form_field(raw_value: Optional[str], field_name: str) -> Optional[Dict[str, Any]]:
+    """Parse an optional JSON form string and raise an HTTP 400 on invalid payloads."""
+    if not raw_value or not raw_value.strip():
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON in '{field_name}'")
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail=f"'{field_name}' must be a JSON object")
+    return parsed
+
+
+def _normalize_identifier(matric_number: Optional[str], external_id: Optional[str]) -> str:
+    """Accept either matric_number or external_id and return a validated normalized value."""
+    chosen = (matric_number or external_id or "").strip()
+    if not chosen:
+        raise HTTPException(status_code=400, detail="Either 'matric_number' or 'external_id' is required")
+    if len(chosen) < 3 or len(chosen) > 64:
+        raise HTTPException(status_code=400, detail="Identifier length must be between 3 and 64 characters")
+    return chosen
+
+
+async def _read_and_validate_frames(files: List[UploadFile]) -> List[bytes]:
+    """Read uploaded files and validate each frame as a usable image."""
+    frames_content: List[bytes] = []
+    for idx, uploaded in enumerate(files):
+        content = await uploaded.read()
+        if not content:
+            raise HTTPException(status_code=400, detail=f"Uploaded file at index {idx} is empty")
+        if not utils.validate_image(content):
+            raise HTTPException(status_code=400, detail=f"Invalid or low-quality image at index {idx}")
+        frames_content.append(content)
+
+    if not frames_content:
+        raise HTTPException(status_code=400, detail="At least one image file is required")
+    return frames_content
+
+
+def _compute_liveness(frames_content: List[bytes], liveness_enabled: bool) -> Tuple[bool, bool]:
+    """Return (liveness_passed, liveness_checked). Liveness is skipped only when disabled."""
+    if not liveness_enabled:
+        return True, False
+    return LivenessDetector.check_liveness(frames_content), True
 
 # --- Student Management ---
 
@@ -211,32 +264,58 @@ def list_students(
 
 # --- Biometric Enrollment ---
 
-@app.post("/api/v1/enroll/upload", status_code=status.HTTP_201_CREATED)
-async def enroll_face(
-    matric_number: str = Form(...),
-    metadata: Optional[str] = Form(None),
-    file: UploadFile = File(...),
-    db: Session = Depends(database.get_db),
-    admin: models.Admin = Depends(get_current_admin)
+async def _enroll_face_impl(
+    db: Session,
+    settings: models.SystemSettings,
+    matric_number: Optional[str],
+    external_id: Optional[str],
+    metadata: Optional[str],
+    single_file: Optional[UploadFile],
+    multiple_files: Optional[List[UploadFile]],
 ):
-    # 1. Fetch from external source (real API or mock)
-    student_data = await fetch_student_from_external(matric_number)
+    matric = _normalize_identifier(matric_number, external_id)
+    files: List[UploadFile] = []
+    if single_file is not None:
+        files.append(single_file)
+    if multiple_files:
+        files.extend(multiple_files)
 
-    # 2. Sync with local database
-    student = db.query(models.Student).filter(models.Student.external_id == matric_number).first()
+    # 1. Read frames, validate image quality baseline and run liveness.
+    frames_content = await _read_and_validate_frames(files)
+    if settings.liveness_enabled and len(frames_content) < MIN_ACTIVE_LIVENESS_FRAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Active liveness requires at least {MIN_ACTIVE_LIVENESS_FRAMES} frames. "
+                "Retake while the subject blinks or turns slightly."
+            ),
+        )
+
+    liveness_passed, liveness_checked = _compute_liveness(frames_content, settings.liveness_enabled)
+    if liveness_checked and not liveness_passed:
+        raise HTTPException(
+            status_code=400,
+            detail="Liveness check failed. Ensure the subject is physically present and retake.",
+        )
+
+    # 2. Fetch from external source (real API or mock)
+    student_data = await fetch_student_from_external(matric)
+
+    # 3. Sync with local database
+    student = db.query(models.Student).filter(models.Student.external_id == matric).first()
     if not student:
         # Create student locally if they exist in main storage but not here
         # Assuming the external API returns a 'full_name' field
         full_name = student_data.get("full_name", "Unknown Name")
         student = models.Student(
-            external_id=matric_number,
+            external_id=matric,
             full_name=full_name
         )
         db.add(student)
         db.commit()
         db.refresh(student)
 
-    contents = await file.read()
+    contents = frames_content[0]
     engine = get_face_engine()
     
     # Real extraction
@@ -250,10 +329,13 @@ async def enroll_face(
     encrypted_template = security.encrypt_data(embedding.tobytes())
 
     # Metadata
-    metadata_dict = json.loads(metadata) if metadata and metadata.strip() else {}
+    metadata_dict = _parse_json_form_field(metadata, "metadata") or {}
     metadata_dict.update({
         "engine": "insightface_buffalo_l",
-        "image_hash": utils.get_image_hash(contents)
+        "image_hash": utils.get_image_hash(contents),
+        "liveness_checked": liveness_checked,
+        "liveness_passed": liveness_passed,
+        "frames_received": len(frames_content),
     })
 
     try:
@@ -274,29 +356,76 @@ async def enroll_face(
 
         student.biometric_enrolled = True
         db.commit()
-        
-        # Update FAISS
-        get_faiss_service().add_student(student.id, embedding)
-        
-        return {"status": "success", "message": f"Face enrollment completed for {student.full_name}"}
+
+        # Rebuild index to avoid stale/duplicate entries on re-enrollment updates.
+        load_faiss_index(db)
+
+        return {
+            "success": True,
+            "status": "success",
+            "message": f"Face enrollment completed for {student.full_name}",
+            "student_id": student.id,
+            "external_id": student.external_id,
+            "liveness_passed": liveness_passed,
+            "liveness_checked": liveness_checked,
+        }
     except Exception as e:
         db.rollback()
         print(f"Enrollment Error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database or Engine error: {str(e)}")
 
+
+@app.post("/api/v1/enroll", status_code=status.HTTP_201_CREATED)
+async def enroll_face(
+    external_id: Optional[str] = Form(None),
+    matric_number: Optional[str] = Form(None),
+    metadata: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(database.get_db),
+    settings: models.SystemSettings = Depends(get_settings),
+    admin: models.Admin = Depends(get_current_admin),
+):
+    return await _enroll_face_impl(
+        db=db,
+        settings=settings,
+        matric_number=matric_number,
+        external_id=external_id,
+        metadata=metadata,
+        single_file=None,
+        multiple_files=files,
+    )
+
+
+@app.post("/api/v1/enroll/upload", status_code=status.HTTP_201_CREATED)
+async def enroll_face_upload(
+    matric_number: Optional[str] = Form(None),
+    external_id: Optional[str] = Form(None),
+    metadata: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    files: List[UploadFile] = File([]),
+    db: Session = Depends(database.get_db),
+    settings: models.SystemSettings = Depends(get_settings),
+    admin: models.Admin = Depends(get_current_admin),
+):
+    return await _enroll_face_impl(
+        db=db,
+        settings=settings,
+        matric_number=matric_number,
+        external_id=external_id,
+        metadata=metadata,
+        single_file=file,
+        multiple_files=files,
+    )
+
 # --- Verification & Identification ---
 
 async def process_verification_images(files: List[UploadFile], liveness_enabled: bool) -> (np.ndarray, bool):
     """Helper to handle multiple frames and liveness."""
-    frames_content = []
-    for f in files:
-        frames_content.append(await f.read())
-    
-    # Check Liveness if enabled
-    liveness_passed = True
-    if liveness_enabled:
-        liveness_passed = LivenessDetector.check_liveness(frames_content)
+    frames_content = await _read_and_validate_frames(files)
+
+    # Liveness is only checked when explicitly enabled and enough frames were supplied.
+    liveness_passed, _ = _compute_liveness(frames_content, liveness_enabled)
     
     # Get embedding from the first frame
     engine = get_face_engine()
@@ -322,6 +451,9 @@ async def verify_student(
     if not student:
         student = db.query(models.Student).filter(models.Student.external_id == identifier).first()
         
+    if not identifier or len(identifier.strip()) < 1:
+        raise HTTPException(status_code=400, detail="Identifier is required")
+
     if not student or not student.biometric_enrolled:
         raise HTTPException(status_code=400, detail="Student not found or not enrolled")
 
@@ -357,13 +489,15 @@ async def verify_student(
     matched = confidence >= settings.similarity_threshold
 
     # 4. Log
+    audit = _parse_json_form_field(audit_info, "audit_info")
+
     log = models.VerificationRecord(
         student_id=student.id,
         match_score=confidence,
         is_successful=matched,
         matching_mode="1:1",
         liveness_passed=liveness_passed,
-        audit_metadata=json.loads(audit_info) if audit_info and audit_info.strip() else None
+        audit_metadata=audit,
     )
     db.add(log)
     db.commit()
@@ -415,6 +549,8 @@ async def identify_student(
     matched = confidence >= settings.similarity_threshold
     student_id = best_match["student_id"] if matched else None
 
+    audit = _parse_json_form_field(audit_info, "audit_info")
+
     # 3. Log
     log = models.VerificationRecord(
         student_id=best_match["student_id"],
@@ -422,7 +558,7 @@ async def identify_student(
         is_successful=matched,
         matching_mode="1:N",
         liveness_passed=liveness_passed,
-        audit_metadata={"search_results": results, "audit": json.loads(audit_info) if audit_info and audit_info.strip() else {}}
+        audit_metadata={"search_results": results, "audit": audit or {}},
     )
     db.add(log)
     db.commit()
