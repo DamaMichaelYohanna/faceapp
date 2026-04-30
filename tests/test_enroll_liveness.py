@@ -9,7 +9,7 @@ Scenarios covered
 -----------------
 1. Liveness passes   — main frame + 2 motion frames → 201
 2. Liveness fails    — main frame + 3 identical frames → 400
-3. Liveness bypass   — single file → 201, liveness_checked=False
+3. Liveness guard    — single file is rejected when active liveness is enabled
 4. No face detected  — mock engine returns None → 400
 5. Excessive motion  — main + high-contrast phase-shift frames → 400
 """
@@ -73,17 +73,16 @@ class TestEnrollLiveness:
         assert response.status_code == 400
         assert "Liveness check failed" in response.json()["detail"]
 
-    def test_single_file_bypasses_liveness_check(self, client):
+        def test_single_file_rejected_when_liveness_frames_are_insufficient(self, client):
         """
-        When only 1 file is submitted there are too few frames to analyse
-        (requires ≥ 2).  Liveness is skipped:
-          - 201 returned
-          - liveness_checked=False recorded in response
+                Active liveness requires multiple frames. A single upload is rejected:
+                    - 400 returned
+                    - detail explains that more frames are required
         """
         response = self._enroll(client, _uid(), sharp_frame())
-        body = response.json()
-        assert response.status_code == 201, f"Unexpected body: {body}"
-        assert body["liveness_checked"] is False
+                body = response.json()
+                assert response.status_code == 400, f"Unexpected body: {body}"
+                assert "requires at least" in body["detail"]
 
     def test_no_face_detected_returns_400(self, client):
         """
