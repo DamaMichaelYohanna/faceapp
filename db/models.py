@@ -77,11 +77,17 @@ class SystemSettings(Base):
     max_attempts = Column(Integer, default=3)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
-class Admin(Base):
-    __tablename__ = "admins"
+class UserRole(enum.Enum):
+    ADMIN = "admin"
+    CAPTURE_STAFF = "capture_staff"
+    VERIFY_STAFF = "verify_staff"
+
+class User(Base):
+    __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    role = Column(Enum(UserRole), default=UserRole.VERIFY_STAFF, nullable=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)

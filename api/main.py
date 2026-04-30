@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import json
 import traceback
 
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
 import numpy as np
@@ -17,6 +20,26 @@ from core.face_engine import get_face_engine
 from core.liveness import LivenessDetector
 from core.faiss_service import get_faiss_service
 import security, utils
+
+
+app = FastAPI(
+    title="Production Face Biometric API",
+    description="Secure 1:1 and 1:N biometric authentication with liveness detection.",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+
+# Allow all origins so the HTML frontend (opened as file://) can reach the API.
+# Restrict origins to your domain in production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # --- Initialization & Lifespan ---
 
@@ -53,11 +76,12 @@ async def lifespan(app: FastAPI):
             db.add(settings)
             
         # Create default admin if none exists
-        admin = db.query(models.Admin).first()
+        admin = db.query(models.User).filter(models.User.role == models.UserRole.ADMIN).first()
         if not admin:
-            default_admin = models.Admin(
+            default_admin = models.User(
                 username=os.getenv("ADMIN_USERNAME", "admin"),
-                hashed_password=security.get_password_hash(os.getenv("ADMIN_PASSWORD", "admin123"))
+                hashed_password=security.get_password_hash(os.getenv("ADMIN_PASSWORD", "admin123")),
+                role=models.UserRole.ADMIN
             )
             db.add(default_admin)
             
@@ -74,34 +98,11 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown logic (if any)
 
-app = FastAPI(
-    title="Production Face Biometric API",
-    description="Secure 1:1 and 1:N biometric authentication with liveness detection.",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
 MIN_ACTIVE_LIVENESS_FRAMES = 3
-
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
-
-# Allow all origins so the HTML frontend (opened as file://) can reach the API.
-# Restrict origins to your domain in production.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # --- Dependency ---
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/admin/login")
-
-def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)):
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -115,32 +116,75 @@ def get_current_admin(token: str = Depends(oauth2_scheme), db: Session = Depends
     except JWTError:
         raise credentials_exception
         
-    admin = db.query(models.Admin).filter(models.Admin.username == username).first()
-    if admin is None or not admin.is_active:
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user is None or not user.is_active:
         raise credentials_exception
-    return admin
+    return user
+
+def check_role(allowed_roles: List[models.UserRole]):
+    def role_checker(current_user: models.User = Depends(get_current_user)):
+        # Admin has unlimited rights
+        if current_user.role == models.UserRole.ADMIN:
+            return current_user
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Operation not permitted"
+            )
+        return current_user
+    return role_checker
+
+require_capture = Depends(check_role([models.UserRole.CAPTURE_STAFF]))
+require_verify = Depends(check_role([models.UserRole.VERIFY_STAFF]))
+require_admin = Depends(check_role([]))
 
 def get_settings(db: Session = Depends(database.get_db)):
     return db.query(models.SystemSettings).first()
 
 # --- Public & Auth API ---
 
-@app.post("/api/v1/admin/login", response_model=schemas.Token)
+@app.post("/api/v1/auth/login", response_model=schemas.Token)
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
-    admin = db.query(models.Admin).filter(models.Admin.username == form_data.username).first()
-    if not admin or not security.verify_password(form_data.password, admin.hashed_password):
+    user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    if not user or not security.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not admin.is_active:
+    if not user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
         
     access_token = security.create_access_token(
-        data={"sub": admin.username}
+        data={"sub": user.username}
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/api/v1/users/", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
+def create_user(
+    user: schemas.UserCreate, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    # Only allow creating capture_staff and verify_staff, not other admins
+    if user.role == models.UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot create users with the admin role.")
+
+    db_user = db.query(models.User).filter(models.User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = security.get_password_hash(user.password)
+    new_user = models.User(
+        username=user.username,
+        hashed_password=hashed_password,
+        role=user.role,
+        is_active=user.is_active
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
 
 from fastapi.responses import JSONResponse
 
@@ -258,7 +302,7 @@ def list_students(
     skip: int = 0, 
     limit: int = 100, 
     db: Session = Depends(database.get_db),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = Depends(get_current_user)
 ):
     return db.query(models.Student).offset(skip).limit(limit).all()
 
@@ -384,7 +428,7 @@ async def enroll_face(
     files: List[UploadFile] = File(...),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
-    admin: models.Admin = Depends(get_current_admin),
+    current_user: models.User = require_capture,
 ):
     return await _enroll_face_impl(
         db=db,
@@ -406,7 +450,7 @@ async def enroll_face_upload(
     files: List[UploadFile] = File([]),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
-    admin: models.Admin = Depends(get_current_admin),
+    current_user: models.User = require_capture,
 ):
     return await _enroll_face_impl(
         db=db,
@@ -441,7 +485,7 @@ async def verify_student(
     audit_info: Optional[str] = Form(None, description="Optional JSON string for audit metadata"),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = require_verify
 ):
     # Try looking up by internal ID first if it's numeric, otherwise by external_id
     student = None
@@ -518,7 +562,7 @@ async def identify_student(
     audit_info: Optional[str] = Form(None, description="Optional JSON string for audit metadata"),
     db: Session = Depends(database.get_db),
     settings: models.SystemSettings = Depends(get_settings),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = require_verify
 ):
     # Combine images
     images = [file] + extra_frames
@@ -577,7 +621,7 @@ async def identify_student(
 @app.get("/admin/settings", response_model=schemas.SystemSettings)
 def get_admin_settings(
     settings: models.SystemSettings = Depends(get_settings),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = require_admin
 ):
     return settings
 
@@ -585,7 +629,7 @@ def get_admin_settings(
 def update_admin_settings(
     payload: schemas.SystemSettingsUpdate, 
     db: Session = Depends(database.get_db),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = require_admin
 ):
     settings = db.query(models.SystemSettings).first()
     for field, value in payload.dict().items():
@@ -597,7 +641,7 @@ def update_admin_settings(
 @app.post("/admin/reload-index")
 def reload_index(
     db: Session = Depends(database.get_db),
-    admin: models.Admin = Depends(get_current_admin)
+    current_user: models.User = require_admin
 ):
     load_faiss_index(db)
     return {"message": "FAISS index reloaded successfully"}
