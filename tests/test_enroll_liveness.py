@@ -73,16 +73,16 @@ class TestEnrollLiveness:
         assert response.status_code == 400
         assert "Liveness check failed" in response.json()["detail"]
 
-        def test_single_file_rejected_when_liveness_frames_are_insufficient(self, client):
+    def test_single_file_rejected_when_liveness_frames_are_insufficient(self, client):
         """
-                Active liveness requires multiple frames. A single upload is rejected:
-                    - 400 returned
-                    - detail explains that more frames are required
+        Active liveness requires multiple frames. A single upload is rejected:
+          - 400 returned
+          - detail explains that more frames are required
         """
         response = self._enroll(client, _uid(), sharp_frame())
-                body = response.json()
-                assert response.status_code == 400, f"Unexpected body: {body}"
-                assert "requires at least" in body["detail"]
+        body = response.json()
+        assert response.status_code == 400, f"Unexpected body: {body}"
+        assert "requires at least" in body["detail"]
 
     def test_no_face_detected_returns_400(self, client):
         """
