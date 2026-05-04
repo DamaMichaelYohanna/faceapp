@@ -17,6 +17,7 @@ Scenarios covered
 import uuid
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -104,6 +105,26 @@ class TestEnrollLiveness:
         assert response.status_code == 400
         assert "No face detected" in response.json()["detail"]
 
+    def test_engine_failure_on_main_capture_returns_400(self, client):
+        """
+        If the face engine throws while processing the main capture,
+        the API should return an actionable 400 instead of a generic 5xx.
+        """
+        engine = MagicMock()
+        engine.get_embedding.side_effect = RuntimeError("embedding inference failed")
+
+        with patch("api.main.get_face_engine", return_value=engine):
+            response = self._enroll(
+                client,
+                _uid(),
+                sharp_frame(),
+                noisy_frame(seed=0),
+                noisy_frame(seed=1),
+            )
+
+        assert response.status_code == 400
+        assert "Could not process the captured image" in response.json()["detail"]
+
     def test_excessive_motion_fails_liveness(self, client):
         """
         Phase-shifted frames produce mean_diff >> EXCESSIVE_MOTION_THRESHOLD (15.0):
@@ -118,3 +139,69 @@ class TestEnrollLiveness:
         )
         assert response.status_code == 400
         assert "Liveness check failed" in response.json()["detail"]
+
+    def test_rejects_when_liveness_frames_have_no_detectable_face(self, client, fixed_embedding):
+        """
+        Main capture has a face, but liveness frames contain no detectable face:
+          - consistency check must fail
+          - API returns actionable out-of-frame guidance
+        """
+        engine = MagicMock()
+        engine.get_embedding.side_effect = [fixed_embedding, None, None]
+
+        with patch("api.main.get_face_engine", return_value=engine):
+            response = self._enroll(
+                client,
+                _uid(),
+                sharp_frame(),
+                noisy_frame(seed=0),
+                noisy_frame(seed=1),
+            )
+
+        assert response.status_code == 400
+        assert "Face not detected in liveness frames" in response.json()["detail"]
+
+    def test_engine_failure_on_liveness_frame_returns_400(self, client, fixed_embedding):
+        """
+        If the engine throws while processing a liveness frame,
+        return a client-facing 400 instead of a generic server failure.
+        """
+        engine = MagicMock()
+        engine.get_embedding.side_effect = [fixed_embedding, RuntimeError("frame decode failed")]
+
+        with patch("api.main.get_face_engine", return_value=engine):
+            response = self._enroll(
+                client,
+                _uid(),
+                sharp_frame(),
+                noisy_frame(seed=0),
+                noisy_frame(seed=1),
+            )
+
+        assert response.status_code == 400
+        assert "Could not process the liveness frame" in response.json()["detail"]
+
+    def test_rejects_when_final_capture_does_not_match_liveness_person(self, client):
+        """
+        Simulate a bait-and-switch: main capture embedding differs strongly
+        from embeddings extracted from liveness frames.
+        """
+        main_embedding = np.zeros(512, dtype=np.float32)
+        main_embedding[0] = 1.0
+        other_embedding = np.zeros(512, dtype=np.float32)
+        other_embedding[1] = 1.0
+
+        engine = MagicMock()
+        engine.get_embedding.side_effect = [main_embedding, other_embedding, other_embedding]
+
+        with patch("api.main.get_face_engine", return_value=engine):
+            response = self._enroll(
+                client,
+                _uid(),
+                sharp_frame(),
+                noisy_frame(seed=5),
+                noisy_frame(seed=6),
+            )
+
+        assert response.status_code == 400
+        assert "does not match the live liveness frames" in response.json()["detail"]

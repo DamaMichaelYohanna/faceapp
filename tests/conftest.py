@@ -104,7 +104,7 @@ def client(db_session, fixed_embedding):
     The TestClient is used as a context manager so the FastAPI lifespan
     (table creation, FAISS warm-up) executes inside the active patches.
     """
-    from api.main import app, get_settings, get_current_admin
+    from api.main import app, get_settings, get_current_user
     from db.database import get_db
 
     def _override_db():
@@ -113,18 +113,19 @@ def client(db_session, fixed_embedding):
     def _override_settings():
         return db_session.query(models.SystemSettings).first()
 
-    # Bypass JWT admin auth for all protected routes
-    _mock_admin = MagicMock(spec=models.Admin)
+    # Bypass JWT auth for all protected routes — mock as ADMIN (bypasses all role checks)
+    _mock_admin = MagicMock(spec=models.User)
     _mock_admin.id = 1
     _mock_admin.username = "testadmin"
     _mock_admin.is_active = True
+    _mock_admin.role = models.UserRole.ADMIN
 
     def _override_current_admin():
         return _mock_admin
 
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_settings] = _override_settings
-    app.dependency_overrides[get_current_admin] = _override_current_admin
+    app.dependency_overrides[get_current_user] = _override_current_admin
 
     _mock_engine = MagicMock()
     _mock_engine.get_embedding.return_value = fixed_embedding
@@ -137,8 +138,13 @@ def client(db_session, fixed_embedding):
         stack.enter_context(
             patch("api.main.get_faiss_service", return_value=_mock_faiss)
         )
+        # Keep crypto stubs consistent: enroll writes placeholder bytes,
+        # verify reads back a deterministic embedding payload.
         stack.enter_context(
             patch("security.encrypt_data", return_value=b"\x00" * 64)
+        )
+        stack.enter_context(
+            patch("security.decrypt_data", return_value=fixed_embedding.tobytes())
         )
         stack.enter_context(patch("utils.validate_image", return_value=True))
         stack.enter_context(patch("utils.get_image_hash", return_value="testhash"))

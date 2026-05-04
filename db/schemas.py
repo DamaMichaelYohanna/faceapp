@@ -42,6 +42,7 @@ class FaceEnrollment(FaceEnrollmentBase):
 class StandardResponse(BaseModel):
     matched: bool
     student_id: Optional[int] = None
+    full_name: Optional[str] = None
     confidence: float
     mode: str
     liveness_passed: bool
@@ -108,3 +109,8 @@ class User(UserBase):
 
     class Config:
         from_attributes = True
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=8)
