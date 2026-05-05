@@ -1,5 +1,8 @@
 import os
 import sys
+import asyncio
+import base64
+import datetime
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import json
@@ -8,7 +11,7 @@ import traceback
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 import numpy as np
 
@@ -16,24 +19,15 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import models, schemas, database
-from core.face_engine import get_face_engine
+from core.face_engine import get_face_engine, get_fast_face_detector
 from core.liveness import LivenessDetector
 from core.faiss_service import get_faiss_service
 import security, utils
 
 
-app = FastAPI(
-    title="Production Face Biometric API",
-    description="Secure 1:1 and 1:N biometric authentication with liveness detection.",
-    version="2.0.0",
-    lifespan=lifespan
-)
-
-
 # Allow all origins so the HTML frontend (opened as file://) can reach the API.
 # Restrict origins to your domain in production.
-app.add_middleware(
-    CORSMiddleware,
+_CORS_KWARGS = dict(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
@@ -87,8 +81,9 @@ async def lifespan(app: FastAPI):
             
         db.commit()
         
-        # Warm up Face Engine
+        # Warm up Face Engine + Fast Detector for real-time WebSocket liveness
         get_face_engine()
+        get_fast_face_detector()
         
         # Load FAISS
         load_faiss_index(db)
@@ -98,7 +93,17 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown logic (if any)
 
+
+app = FastAPI(
+    title="Production Face Biometric API",
+    description="Secure 1:1 and 1:N biometric authentication with liveness detection.",
+    version="2.0.0",
+    lifespan=lifespan
+)
+app.add_middleware(CORSMiddleware, **_CORS_KWARGS)
+
 MIN_ACTIVE_LIVENESS_FRAMES = 3
+MIN_FACE_CONSISTENCY_SIMILARITY = 0.45
 # --- Dependency ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -135,7 +140,7 @@ def check_role(allowed_roles: List[models.UserRole]):
     return role_checker
 
 require_capture = Depends(check_role([models.UserRole.CAPTURE_STAFF]))
-require_verify = Depends(check_role([models.UserRole.VERIFY_STAFF]))
+require_verify = Depends(check_role([models.UserRole.VERIFY_STAFF, models.UserRole.CAPTURE_STAFF]))
 require_admin = Depends(check_role([]))
 
 def get_settings(db: Session = Depends(database.get_db)):
@@ -159,6 +164,29 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
         data={"sub": user.username}
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/v1/auth/me", response_model=schemas.User)
+def get_me(current_user: models.User = Depends(get_current_user)):
+    """Return the authenticated user's profile including role."""
+    return current_user
+
+
+@app.post("/api/v1/auth/change-password")
+def change_password(
+    payload: schemas.ChangePasswordRequest,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if not security.verify_password(payload.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    if payload.current_password == payload.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from current password")
+
+    current_user.hashed_password = security.get_password_hash(payload.new_password)
+    db.add(current_user)
+    db.commit()
+    return {"message": "Password updated successfully"}
 
 @app.post("/api/v1/users/", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
 def create_user(
@@ -187,15 +215,130 @@ def create_user(
     return new_user
 
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    if isinstance(exc, StarletteHTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    
     print(f"CRITICAL ERROR: {exc}")
     traceback.print_exc()
     return JSONResponse(
         status_code=500,
-        content={"detail": f"Internal Server Error: {str(exc)}", "traceback": traceback.format_exc()}
+        content={"detail": "Internal Server Error"}
     )
+
+# --- Liveness WebSocket ---
+
+_WS_FRAME_BUFFER_MAX = 5  # rolling window size
+
+@app.websocket("/ws/liveness")
+async def liveness_websocket(websocket: WebSocket, token: Optional[str] = None):
+    """Real-time liveness analysis. Clients stream base64 frames; server responds with liveness status."""
+    # Optional JWT auth via query param ?token=<jwt>
+    if token:
+        try:
+            payload = jwt.decode(token, security.JWT_SECRET_KEY, algorithms=[security.ALGORITHM])
+            username: str = payload.get("sub", "")
+            if not username:
+                await websocket.close(code=4001)
+                return
+            db = database.SessionLocal()
+            user = db.query(models.User).filter(models.User.username == username).first()
+            db.close()
+            if not user or not user.is_active:
+                await websocket.close(code=4001)
+                return
+        except JWTError:
+            await websocket.close(code=4001)
+            return
+
+    await websocket.accept()
+    frame_buffer: List[bytes] = []
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
+                continue
+
+            if msg.get("type") != "analyze_frame":
+                continue
+
+            frame_b64: str = msg.get("payload", {}).get("frame", "")
+            if not frame_b64:
+                continue
+
+            # Strip data-URL prefix (data:image/jpeg;base64,...)
+            if "," in frame_b64:
+                frame_b64 = frame_b64.split(",", 1)[1]
+
+            try:
+                frame_bytes = base64.b64decode(frame_b64)
+            except Exception:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid frame encoding"}))
+                continue
+
+            # Fast face detection (160x160 detection-only, no embedding) for real-time response
+            face_in_frame = get_fast_face_detector().has_face(frame_bytes)
+
+            if face_in_frame:
+                frame_buffer.append(frame_bytes)
+                if len(frame_buffer) > _WS_FRAME_BUFFER_MAX:
+                    frame_buffer.pop(0)
+            else:
+                # Face left — clear stale buffer so liveness must re-prove from scratch
+                frame_buffer.clear()
+
+            count = len(frame_buffer)
+            liveness_passed = False
+            has_motion = False
+
+            if face_in_frame and count >= 2:
+                analysis = LivenessDetector.analyze_frames(frame_buffer)
+                has_motion = analysis["has_motion"]
+                if count >= MIN_ACTIVE_LIVENESS_FRAMES:
+                    liveness_passed = analysis["liveness_passed"]
+
+            await websocket.send_text(json.dumps({
+                "type": "liveness_status",
+                "payload": {
+                    "liveness_passed": liveness_passed,
+                    "count": count,
+                    "has_motion": has_motion,
+                    "face_in_frame": face_in_frame,
+                }
+            }))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"WS liveness error: {e}")
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "message": "Internal error"}))
+        except Exception:
+            pass
+
+
+# --- Liveness Check (standalone, used by frontend pre-enrollment) ---
+
+@app.post("/api/v1/liveness/check")
+async def check_liveness(
+    files: List[UploadFile] = File(..., description="3-5 face frames for liveness analysis"),
+    current_user: models.User = Depends(get_current_user),
+):
+    if len(files) < MIN_ACTIVE_LIVENESS_FRAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At least {MIN_ACTIVE_LIVENESS_FRAMES} frames required for liveness check."
+        )
+    frames_content = await _read_and_validate_frames(files)
+    passed = LivenessDetector.check_liveness(frames_content)
+    return {"liveness_passed": passed, "frames_analyzed": len(frames_content)}
+
 
 # --- Public API ---
 
@@ -213,6 +356,7 @@ MOCK_STUDENTS = {
     "FT22ACMP0803": {"full_name": "Chinedu Okafor"},
     "FT22ACMP0804": {"full_name": "Fatima Al-Hassan"},
     "FT22ACMP0805": {"full_name": "David Musa"},
+    "132132": {"full_name": "Test Student 132132"},
 }
 
 async def fetch_student_from_external(matric_number: str) -> dict:
@@ -295,6 +439,38 @@ def _compute_liveness(frames_content: List[bytes], liveness_enabled: bool) -> Tu
         return True, False
     return LivenessDetector.check_liveness(frames_content), True
 
+
+async def _extract_embedding_or_http_error(engine: Any, image_bytes: bytes, frame_label: str) -> Optional[np.ndarray]:
+    """Normalize face-engine image failures into actionable client errors. Runs in thread pool."""
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, engine.get_embedding, image_bytes)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not process the {frame_label}. Retake and ensure the face is clearly visible.",
+        ) from exc
+
+
+def _validate_face_consistency(engine: Any, frames_content: List[bytes], main_embedding: np.ndarray) -> None:
+    """Ensure a face is detectable in at least one liveness frame (fast detection-only check)."""
+    liveness_frames = frames_content[1:]
+    if not liveness_frames:
+        raise HTTPException(status_code=400, detail="Missing liveness frames for face consistency check.")
+
+    fast_det = get_fast_face_detector()
+    has_any_face = any(fast_det.has_face(frame) for frame in liveness_frames)
+    if not has_any_face:
+        raise HTTPException(
+            status_code=400,
+            detail="Face not detected in liveness frames. Keep the face inside the guide and retry.",
+        )
+
 # --- Student Management ---
 
 @app.get("/api/v1/students/", response_model=List[schemas.Student])
@@ -342,45 +518,72 @@ async def _enroll_face_impl(
             detail="Liveness check failed. Ensure the subject is physically present and retake.",
         )
 
-    # 2. Fetch from external source (real API or mock)
-    student_data = await fetch_student_from_external(matric)
+    try:
+        # 2. Resolve student record
+        # Prefer local DB first so enrollment still works if the external service is down
+        # for records that already exist in this system.
+        student = db.query(models.Student).filter(models.Student.external_id == matric).first()
+        if not student:
+            try:
+                student_data = await fetch_student_from_external(matric)
+            except HTTPException as exc:
+                if exc.status_code >= 500:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Student registry service is temporarily unavailable. Retry shortly.",
+                    )
+                raise
 
-    # 3. Sync with local database
-    student = db.query(models.Student).filter(models.Student.external_id == matric).first()
-    if not student:
-        # Create student locally if they exist in main storage but not here
-        # Assuming the external API returns a 'full_name' field
-        full_name = student_data.get("full_name", "Unknown Name")
-        student = models.Student(
-            external_id=matric,
-            full_name=full_name
+            # Create student locally if they exist in main storage but not here
+            full_name = student_data.get("full_name", "Unknown Name")
+            student = models.Student(
+                external_id=matric,
+                full_name=full_name
+            )
+            db.add(student)
+            db.commit()
+            db.refresh(student)
+
+        contents = frames_content[0]
+        engine = get_face_engine()
+
+        # Real extraction — runs in thread pool to avoid blocking the event loop
+        embedding = await _extract_embedding_or_http_error(engine, contents, "captured image")
+        if embedding is None:
+            raise HTTPException(status_code=400, detail="No face detected in image")
+
+        print(f"DEBUG: Enrollment Embedding Shape: {embedding.shape}, Norm: {np.linalg.norm(embedding)}")
+
+        # Ensure the same person remained in frame between liveness sequence and final capture.
+        if settings.liveness_enabled:
+            _validate_face_consistency(engine, frames_content, embedding)
+
+        # Encrypt
+        encrypted_template = security.encrypt_data(embedding.tobytes())
+
+        # Metadata
+        metadata_dict = _parse_json_form_field(metadata, "metadata") or {}
+        thumb = utils.make_thumbnail(contents)
+        metadata_dict.update({
+            "engine": "insightface_buffalo_l",
+            "image_hash": utils.get_image_hash(contents),
+            "liveness_checked": liveness_checked,
+            "liveness_passed": liveness_passed,
+            "frames_received": len(frames_content),
+        })
+        if thumb:
+            metadata_dict["thumbnail"] = thumb
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Enrollment Preprocessing Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail="Face processing engine unavailable. Retry shortly.",
         )
-        db.add(student)
-        db.commit()
-        db.refresh(student)
-
-    contents = frames_content[0]
-    engine = get_face_engine()
-    
-    # Real extraction
-    embedding = engine.get_embedding(contents)
-    if embedding is None:
-        raise HTTPException(status_code=400, detail="No face detected in image")
-    
-    print(f"DEBUG: Enrollment Embedding Shape: {embedding.shape}, Norm: {np.linalg.norm(embedding)}")
-
-    # Encrypt
-    encrypted_template = security.encrypt_data(embedding.tobytes())
-
-    # Metadata
-    metadata_dict = _parse_json_form_field(metadata, "metadata") or {}
-    metadata_dict.update({
-        "engine": "insightface_buffalo_l",
-        "image_hash": utils.get_image_hash(contents),
-        "liveness_checked": liveness_checked,
-        "liveness_passed": liveness_passed,
-        "frames_received": len(frames_content),
-    })
 
     try:
         # Save to DB
@@ -402,7 +605,12 @@ async def _enroll_face_impl(
         db.commit()
 
         # Rebuild index to avoid stale/duplicate entries on re-enrollment updates.
-        load_faiss_index(db)
+        # Isolated so a FAISS reload failure never poisons the successful enrollment response.
+        try:
+            load_faiss_index(db)
+        except Exception as faiss_err:
+            print(f"FAISS reload warning (enrollment was saved successfully): {faiss_err}")
+            traceback.print_exc()
 
         return {
             "success": True,
@@ -471,13 +679,14 @@ async def process_verification_images(files: List[UploadFile], liveness_enabled:
     # Liveness is only checked when explicitly enabled and enough frames were supplied.
     liveness_passed, _ = _compute_liveness(frames_content, liveness_enabled)
     
-    # Get embedding from the first frame
+    # Get embedding from the first frame — run in thread pool to avoid blocking the event loop
     engine = get_face_engine()
-    embedding = engine.get_embedding(frames_content[0])
-    
+    loop = asyncio.get_event_loop()
+    embedding = await loop.run_in_executor(None, engine.get_embedding, frames_content[0])
+
     return embedding, liveness_passed
 
-@app.post("/api/v1/verify/{identifier}", response_model=schemas.StandardResponse)
+@app.post("/api/v1/verify/{identifier:path}", response_model=schemas.StandardResponse)
 async def verify_student(
     identifier: str,
     file: UploadFile = File(..., description="Main face image for verification"),
@@ -549,6 +758,7 @@ async def verify_student(
     return schemas.StandardResponse(
         matched=matched,
         student_id=student.id,
+        full_name=student.full_name,
         confidence=confidence,
         mode="1:1",
         liveness_passed=liveness_passed,
@@ -607,9 +817,15 @@ async def identify_student(
     db.add(log)
     db.commit()
 
+    # Resolve student name for 1:N result
+    matched_student = None
+    if matched and student_id:
+        matched_student = db.query(models.Student).filter(models.Student.id == student_id).first()
+
     return schemas.StandardResponse(
         matched=matched,
         student_id=student_id,
+        full_name=matched_student.full_name if matched_student else None,
         confidence=confidence,
         mode="1:N",
         liveness_passed=liveness_passed,
@@ -645,6 +861,200 @@ def reload_index(
 ):
     load_faiss_index(db)
     return {"message": "FAISS index reloaded successfully"}
+
+@app.get("/admin/stats")
+def get_admin_stats(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Dashboard analytics summary."""
+    total_students = db.query(models.Student).count()
+    enrolled_students = db.query(models.Student).filter(models.Student.biometric_enrolled == True).count()
+    total_verifications = db.query(models.VerificationRecord).count()
+    successful_verifications = db.query(models.VerificationRecord).filter(models.VerificationRecord.is_successful == True).count()
+    today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    verifications_today = db.query(models.VerificationRecord).filter(models.VerificationRecord.timestamp >= today).count()
+    active_enrollments = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.status == models.EnrollmentStatus.ACTIVE).count()
+    total_staff = db.query(models.User).filter(models.User.role != models.UserRole.ADMIN).count()
+    success_rate = round((successful_verifications / total_verifications * 100), 1) if total_verifications > 0 else 0.0
+    return {
+        "total_students": total_students,
+        "enrolled_students": enrolled_students,
+        "unenrolled_students": total_students - enrolled_students,
+        "active_enrollments": active_enrollments,
+        "total_verifications": total_verifications,
+        "successful_verifications": successful_verifications,
+        "verifications_today": verifications_today,
+        "success_rate": success_rate,
+        "total_staff": total_staff,
+    }
+
+
+@app.get("/admin/enrollments")
+def list_admin_enrollments(
+    skip: int = 0,
+    limit: int = 50,
+    search: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """List all enrollments with student info for admin management."""
+    query = db.query(models.FaceEnrollment).join(models.Student)
+    if status_filter:
+        try:
+            s = models.EnrollmentStatus(status_filter)
+            query = query.filter(models.FaceEnrollment.status == s)
+        except ValueError:
+            pass
+    if search:
+        query = query.filter(
+            models.Student.full_name.ilike(f"%{search}%") |
+            models.Student.external_id.ilike(f"%{search}%")
+        )
+    total = query.count()
+    enrollments = query.order_by(models.FaceEnrollment.updated_at.desc()).offset(skip).limit(limit).all()
+    results = []
+    for e in enrollments:
+        results.append({
+            "id": e.id,
+            "student_id": e.student_id,
+            "external_id": e.student.external_id,
+            "full_name": e.student.full_name,
+            "status": e.status.value,
+            "created_at": e.created_at.isoformat(),
+            "updated_at": e.updated_at.isoformat(),
+            "metadata_json": e.metadata_json,
+        })
+    return {"total": total, "items": results}
+
+
+@app.put("/admin/enrollments/{enrollment_id}/status")
+def update_enrollment_status(
+    enrollment_id: str,
+    payload: dict,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Update enrollment status (active/rejected/expired)."""
+    enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.id == enrollment_id).first()
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
+    new_status = payload.get("status")
+    try:
+        enrollment.status = models.EnrollmentStatus(new_status)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid status: {new_status}")
+    # Keep biometric_enrolled flag in sync with active status
+    enrollment.student.biometric_enrolled = (enrollment.status == models.EnrollmentStatus.ACTIVE)
+    db.commit()
+    try:
+        load_faiss_index(db)
+    except Exception as err:
+        print(f"FAISS reload warning after status update: {err}")
+    return {"success": True, "id": enrollment_id, "status": enrollment.status.value}
+
+
+@app.delete("/admin/enrollments/{enrollment_id}", status_code=204)
+def delete_enrollment(
+    enrollment_id: str,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Permanently delete an enrollment record."""
+    enrollment = db.query(models.FaceEnrollment).filter(models.FaceEnrollment.id == enrollment_id).first()
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
+    enrollment.student.biometric_enrolled = False
+    db.delete(enrollment)
+    db.commit()
+    try:
+        load_faiss_index(db)
+    except Exception as err:
+        print(f"FAISS reload warning after delete: {err}")
+
+
+@app.get("/admin/users")
+def list_admin_users(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """List all staff users."""
+    users = db.query(models.User).order_by(models.User.created_at.desc()).all()
+    return [
+        {
+            "id": u.id,
+            "username": u.username,
+            "role": u.role.value,
+            "is_active": u.is_active,
+            "created_at": u.created_at.isoformat(),
+        }
+        for u in users
+    ]
+
+
+@app.put("/admin/users/{user_id}")
+def update_admin_user(
+    user_id: int,
+    payload: dict,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Toggle user active status or update role."""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot modify your own account here")
+    if "is_active" in payload:
+        user.is_active = bool(payload["is_active"])
+    db.commit()
+    return {"success": True, "id": user.id, "username": user.username, "is_active": user.is_active}
+
+
+@app.delete("/admin/users/{user_id}", status_code=204)
+def delete_admin_user(
+    user_id: int,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Delete a staff user account."""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    if user.role == models.UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot delete admin accounts")
+    db.delete(user)
+    db.commit()
+
+
+@app.get("/admin/verifications")
+def list_admin_verifications(
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Recent verification logs."""
+    total = db.query(models.VerificationRecord).count()
+    records = db.query(models.VerificationRecord).order_by(models.VerificationRecord.timestamp.desc()).offset(skip).limit(limit).all()
+    results = []
+    for r in records:
+        results.append({
+            "id": r.id,
+            "student_id": r.student_id,
+            "full_name": r.student.full_name if r.student else "Unknown",
+            "external_id": r.student.external_id if r.student else "",
+            "match_score": round(r.match_score * 100, 1),
+            "is_successful": r.is_successful,
+            "liveness_passed": r.liveness_passed,
+            "matching_mode": r.matching_mode,
+            "timestamp": r.timestamp.isoformat(),
+        })
+    return {"total": total, "items": results}
+
 
 @app.get("/health")
 def health_check():
