@@ -1094,6 +1094,86 @@ def delete_admin_user(
     db.commit()
 
 
+@app.get("/admin/verifications/stats")
+def get_verification_stats(
+    search: Optional[str] = None,
+    mode_filter: Optional[str] = None,
+    result_filter: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = require_admin
+):
+    """Aggregate analytics for the audit panel — respects same filters as the list endpoint."""
+    query = db.query(models.VerificationRecord).join(models.Student, isouter=True)
+
+    if mode_filter in ("1:1", "1:N"):
+        query = query.filter(models.VerificationRecord.matching_mode == mode_filter)
+    if result_filter == "success":
+        query = query.filter(models.VerificationRecord.is_successful == True)
+    elif result_filter == "fail":
+        query = query.filter(models.VerificationRecord.is_successful == False)
+    if search:
+        query = query.filter(
+            models.Student.full_name.ilike(f"%{search}%") |
+            models.Student.external_id.ilike(f"%{search}%")
+        )
+    if date_from:
+        try:
+            query = query.filter(models.VerificationRecord.timestamp >= datetime.datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            query = query.filter(models.VerificationRecord.timestamp <= datetime.datetime.fromisoformat(date_to))
+        except ValueError:
+            pass
+
+    records = query.all()
+    total = len(records)
+
+    if total == 0:
+        return {
+            "total": 0, "matched": 0, "failed": 0, "match_rate": 0.0,
+            "avg_confidence": 0.0, "liveness_pass_rate": 0.0,
+            "mode_breakdown": {}, "top_operators": [], "score_buckets": [0] * 10,
+        }
+
+    scores = [r.match_score for r in records]
+    matched = sum(1 for r in records if r.is_successful)
+    liveness_passed_count = sum(1 for r in records if r.liveness_passed)
+
+    # Build 10 score buckets: 0-10%, 10-20%, ..., 90-100%
+    buckets = [0] * 10
+    for s in scores:
+        buckets[min(int(s * 10), 9)] += 1
+
+    # Mode breakdown
+    mode_breakdown: dict = {}
+    for r in records:
+        mode_breakdown[r.matching_mode] = mode_breakdown.get(r.matching_mode, 0) + 1
+
+    # Top operators from audit_metadata
+    op_counts: dict = {}
+    for r in records:
+        op = (r.audit_metadata or {}).get("operator", "")
+        if op:
+            op_counts[op] = op_counts.get(op, 0) + 1
+    top_ops = sorted(op_counts.items(), key=lambda x: -x[1])[:5]
+
+    return {
+        "total": total,
+        "matched": matched,
+        "failed": total - matched,
+        "match_rate": round(matched / total * 100, 1),
+        "avg_confidence": round(sum(scores) / total * 100, 1),
+        "liveness_pass_rate": round(liveness_passed_count / total * 100, 1),
+        "mode_breakdown": mode_breakdown,
+        "top_operators": [{"operator": k, "count": v} for k, v in top_ops],
+        "score_buckets": buckets,
+    }
+
+
 @app.get("/admin/verifications")
 def list_admin_verifications(
     skip: int = 0,
