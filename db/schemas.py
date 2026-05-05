@@ -44,6 +44,8 @@ class StandardResponse(BaseModel):
     student_id: Optional[int] = None
     full_name: Optional[str] = None
     confidence: float
+    threshold: float = 0.0          # The threshold that was active at decision time
+    decision_reason: str = ""       # Human-readable decision explanation
     mode: str
     liveness_passed: bool
     message: str

@@ -102,6 +102,29 @@ app = FastAPI(
 )
 app.add_middleware(CORSMiddleware, **_CORS_KWARGS)
 
+# =============================================================================
+# SDK / PROVIDER INTEGRATION STUBS
+# To swap in a commercial SDK (e.g. AWS Rekognition, Azure Face, NEC NeoFace,
+# Innovatrics, or Aware), replace the relevant functions below with the
+# provider's client calls. The rest of the pipeline (liveness, audit logging,
+# 1:1 vs 1:N routing, FAISS index) remains unchanged.
+#
+# Required interface for any provider adapter:
+#   get_embedding(image_bytes: bytes) -> np.ndarray   # L2-normalised 512-d vector
+#   has_face(image_bytes: bytes) -> bool
+#   compare(emb_a, emb_b) -> float                    # cosine similarity 0–1
+#
+# Decision thresholds (configurable via SystemSettings.similarity_threshold):
+#   >= 0.75  High confidence match
+#   >= 0.65  Standard match  (default)
+#   < 0.65   No-match
+#   < 0.30   Definitive reject
+#
+# 1:1 Verification  → POST /api/v1/verify/{identifier}  (require identifier)
+# 1:N Identification → POST /api/v1/identify            (no identifier needed)
+# Both routes log to VerificationRecord with matching_mode='1:1' / '1:N'
+# =============================================================================
+
 MIN_ACTIVE_LIVENESS_FRAMES = 3
 MIN_FACE_CONSISTENCY_SIMILARITY = 0.45
 # --- Dependency ---
@@ -741,8 +764,18 @@ async def verify_student(
     print(f"DEBUG: Resulting Confidence: {confidence}")
     matched = confidence >= settings.similarity_threshold
 
-    # 4. Log
-    audit = _parse_json_form_field(audit_info, "audit_info")
+    # 4. Log — include operator identity and decision context in audit metadata
+    audit = _parse_json_form_field(audit_info, "audit_info") or {}
+    audit.update({
+        "operator": current_user.username,
+        "operator_role": current_user.role.value,
+        "threshold": settings.similarity_threshold,
+        "raw_confidence": round(confidence, 6),
+        "decision_reason": (
+            "liveness_failed" if not liveness_passed
+            else ("above_threshold" if matched else "below_threshold")
+        ),
+    })
 
     log = models.VerificationRecord(
         student_id=student.id,
@@ -755,11 +788,21 @@ async def verify_student(
     db.add(log)
     db.commit()
 
+    decision_reason = (
+        f"Liveness check failed — no match recorded"
+        if not liveness_passed
+        else (f"Confidence {confidence:.2%} ≥ threshold {settings.similarity_threshold:.2%} — match confirmed"
+              if matched
+              else f"Confidence {confidence:.2%} < threshold {settings.similarity_threshold:.2%} — match rejected")
+    )
+
     return schemas.StandardResponse(
         matched=matched,
         student_id=student.id,
         full_name=student.full_name,
         confidence=confidence,
+        threshold=settings.similarity_threshold,
+        decision_reason=decision_reason,
         mode="1:1",
         liveness_passed=liveness_passed,
         message="Match successful" if matched else "Match failed"
@@ -803,7 +846,18 @@ async def identify_student(
     matched = confidence >= settings.similarity_threshold
     student_id = best_match["student_id"] if matched else None
 
-    audit = _parse_json_form_field(audit_info, "audit_info")
+    audit = _parse_json_form_field(audit_info, "audit_info") or {}
+    audit.update({
+        "operator": current_user.username,
+        "operator_role": current_user.role.value,
+        "threshold": settings.similarity_threshold,
+        "raw_confidence": round(confidence, 6),
+        "search_results": results,
+        "decision_reason": (
+            "liveness_failed" if not liveness_passed
+            else ("above_threshold" if matched else "below_threshold")
+        ),
+    })
 
     # 3. Log
     log = models.VerificationRecord(
@@ -812,7 +866,7 @@ async def identify_student(
         is_successful=matched,
         matching_mode="1:N",
         liveness_passed=liveness_passed,
-        audit_metadata={"search_results": results, "audit": audit or {}},
+        audit_metadata=audit,
     )
     db.add(log)
     db.commit()
@@ -822,11 +876,21 @@ async def identify_student(
     if matched and student_id:
         matched_student = db.query(models.Student).filter(models.Student.id == student_id).first()
 
+    decision_reason = (
+        f"Liveness check failed — no match recorded"
+        if not liveness_passed
+        else (f"Confidence {confidence:.2%} ≥ threshold {settings.similarity_threshold:.2%} — identity confirmed"
+              if matched
+              else f"Confidence {confidence:.2%} < threshold {settings.similarity_threshold:.2%} — identity unconfirmed")
+    )
+
     return schemas.StandardResponse(
         matched=matched,
         student_id=student_id,
         full_name=matched_student.full_name if matched_student else None,
         confidence=confidence,
+        threshold=settings.similarity_threshold,
+        decision_reason=decision_reason,
         mode="1:N",
         liveness_passed=liveness_passed,
         message="Identified" if matched else "Identity not confirmed"
@@ -1034,24 +1098,60 @@ def delete_admin_user(
 def list_admin_verifications(
     skip: int = 0,
     limit: int = 50,
+    search: Optional[str] = None,
+    mode_filter: Optional[str] = None,       # '1:1' or '1:N'
+    result_filter: Optional[str] = None,     # 'success' or 'fail'
+    date_from: Optional[str] = None,         # ISO date string
+    date_to: Optional[str] = None,
     db: Session = Depends(database.get_db),
     current_user: models.User = require_admin
 ):
-    """Recent verification logs."""
-    total = db.query(models.VerificationRecord).count()
-    records = db.query(models.VerificationRecord).order_by(models.VerificationRecord.timestamp.desc()).offset(skip).limit(limit).all()
+    """Paginated, filterable verification audit log."""
+    query = db.query(models.VerificationRecord).join(models.Student, isouter=True)
+
+    if mode_filter in ("1:1", "1:N"):
+        query = query.filter(models.VerificationRecord.matching_mode == mode_filter)
+    if result_filter == "success":
+        query = query.filter(models.VerificationRecord.is_successful == True)
+    elif result_filter == "fail":
+        query = query.filter(models.VerificationRecord.is_successful == False)
+    if search:
+        query = query.filter(
+            models.Student.full_name.ilike(f"%{search}%") |
+            models.Student.external_id.ilike(f"%{search}%")
+        )
+    if date_from:
+        try:
+            query = query.filter(models.VerificationRecord.timestamp >= datetime.datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            query = query.filter(models.VerificationRecord.timestamp <= datetime.datetime.fromisoformat(date_to))
+        except ValueError:
+            pass
+
+    total = query.count()
+    records = query.order_by(models.VerificationRecord.timestamp.desc()).offset(skip).limit(limit).all()
     results = []
     for r in records:
+        audit = r.audit_metadata or {}
         results.append({
             "id": r.id,
             "student_id": r.student_id,
             "full_name": r.student.full_name if r.student else "Unknown",
             "external_id": r.student.external_id if r.student else "",
             "match_score": round(r.match_score * 100, 1),
+            "raw_confidence": round(r.match_score, 6),
             "is_successful": r.is_successful,
             "liveness_passed": r.liveness_passed,
             "matching_mode": r.matching_mode,
             "timestamp": r.timestamp.isoformat(),
+            "operator": audit.get("operator", ""),
+            "operator_role": audit.get("operator_role", ""),
+            "threshold": audit.get("threshold", ""),
+            "decision_reason": audit.get("decision_reason", ""),
+            "audit_metadata": audit,
         })
     return {"total": total, "items": results}
 
