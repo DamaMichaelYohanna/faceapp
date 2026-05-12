@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+python-multipart
+cryptography
+python-dotenv
+numpy
+httpx
+insightface
+onnxruntime
+opencv-python
+Pillow
+psycopg2-binary
+bcrypt
